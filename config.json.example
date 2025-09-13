@@ -1,0 +1,19 @@
+{
+    "server": {
+        "host": "irc.example.com",
+        "port": 6667,
+        "nickname": "GlineBot"
+    },
+    "oper": {
+        "username": "your_oper_username",
+        "password": "your_oper_password"
+    },
+    "channel": "#services_infos",
+    "gline": {
+        "duration": 7200,
+        "ip_reason": "Auto Gline - BNC IP contournant ban existant",
+        "hostname_reason": "Auto Gline - BNC hostname contournant ban existant",
+        "nick_reason": "Auto Gline - Pseudo contournant ban via BNC"
+    },
+    "update_interval": 900
+}
