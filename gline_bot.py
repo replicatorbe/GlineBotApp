@@ -64,7 +64,7 @@ class GlineBot(irc.bot.SingleServerIRCBot):
         self.gline_duration = self.gline_config.get('duration', 7200)
         
         # Configuration de mise à jour
-        self.update_interval = config.get('update_interval', 900)
+        self.update_interval = config.get('update_interval', 300)
         
         # Liste locale des IP déjà bannies (GLINE) - vidée au démarrage
         self.glined_ips: Set[str] = set()
@@ -83,6 +83,10 @@ class GlineBot(irc.bot.SingleServerIRCBot):
         self.server_gline_check_pending = False
         self.verification_timeout = 30  # Timeout en secondes pour la vérification
         self.verification_start_time = None
+
+        # Listes temporaires pour la synchronisation STATS g
+        self.stats_g_temp_list = None
+        self.stats_g_temp_details = None
         
         # Cooldown anti-spam pour les rebans
         self.reban_cooldown = 60  # Cooldown de 60 secondes
@@ -139,23 +143,33 @@ class GlineBot(irc.bot.SingleServerIRCBot):
     
     def on_223(self, connection, event):
         """Appelé pour les réponses STATS g (code IRC 223)"""
-        if self.stats_g_requested and len(event.arguments) >= 2:
+        # Traiter les STATS g pour la synchronisation OU pour la vérification de contournement
+        if (self.stats_g_requested or self.server_gline_check_pending) and len(event.arguments) >= 2:
+            # Initialiser les listes temporaires au premier message STATS g
+            if self.stats_g_temp_list is None:
+                self.stats_g_temp_list = set()
+                self.stats_g_temp_details = {}
+                if self.stats_g_requested:
+                    logging.debug("🔄 Début synchronisation STATS g - Vidage des listes temporaires")
+                else:
+                    logging.debug("🔍 Début vérification STATS g pour contournement")
+
             # Format: ['G', '*@IP/host', 'duration', 'timestamp', 'setter', 'reason']
             if event.arguments[0] == 'G':
                 gline_info = " ".join(str(arg) for arg in event.arguments)
                 logging.debug(f"GLINE reçue: {gline_info}")
-                self.parse_gline_message(gline_info)
+                self.parse_gline_to_temp(gline_info)
 
-    def parse_gline_message(self, message: str):
-        """Parse un message contenant des GLINE"""
+    def parse_gline_to_temp(self, message: str):
+        """Parse un message contenant des GLINE et les stocke dans les listes temporaires"""
         # Extraire les détails complets des GLINE avec raison
         # Format UnrealIRCd STATS g: G *@IP duration timestamp setter :reason
         gline_pattern = r'G \*@([\d\.\*]+)\s+(\d+)\s+(\d+)\s+(\S+)\s+:(.+)'
         gline_matches = re.finditer(gline_pattern, message)
-        
+
         for match in gline_matches:
             target, duration, timestamp, setter, reason = match.groups()
-            
+
             # Stocker les détails de la GLINE
             gline_info = {
                 'target': target,
@@ -164,65 +178,82 @@ class GlineBot(irc.bot.SingleServerIRCBot):
                 'setter': setter,
                 'reason': reason.strip()
             }
-            
-            if target not in self.glined_ips:
-                self.glined_ips.add(target)
-                self.gline_details[target] = gline_info
+
+            if target not in self.stats_g_temp_list:
+                self.stats_g_temp_list.add(target)
+                self.stats_g_temp_details[target] = gline_info
                 logging.debug(f"📥 CHARGEMENT GLINE: {target} - Raison: {reason} - Par: {setter}")
-        
+
         # Fallback: extraire les IP sans détails (ancien comportement)
         ip_matches = re.findall(r'\*@(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', message)
         for ip in ip_matches:
-            if ip not in self.glined_ips:
-                self.glined_ips.add(ip)
+            if ip not in self.stats_g_temp_list:
+                self.stats_g_temp_list.add(ip)
                 # Créer une entrée basique si pas de détails
-                if ip not in self.gline_details:
-                    self.gline_details[ip] = {
+                if ip not in self.stats_g_temp_details:
+                    self.stats_g_temp_details[ip] = {
                         'target': ip,
                         'reason': 'Non spécifiée',
                         'setter': 'Inconnu'
                     }
                 logging.debug(f"📥 CHARGEMENT GLINE IP: {ip}")
-        
+
         # Extraire les patterns /24 (xxx.xxx.xxx.*)
         wildcard_24_matches = re.findall(r'\*@(\d{1,3}\.\d{1,3}\.\d{1,3}\.)\*', message)
         for pattern in wildcard_24_matches:
             base_ip = pattern.rstrip('.')
             pattern_key = f"{base_ip}.*"
-            if pattern_key not in self.glined_ips:
+            if pattern_key not in self.stats_g_temp_list:
                 # Pour les /24, générer toutes les IP (0-255)
                 for i in range(256):
                     full_ip = f"{base_ip}.{i}"
-                    self.glined_ips.add(full_ip)
-                self.glined_ips.add(pattern_key)  # Stocker aussi le pattern
+                    self.stats_g_temp_list.add(full_ip)
+                self.stats_g_temp_list.add(pattern_key)  # Stocker aussi le pattern
                 logging.debug(f"📥 CHARGEMENT GLINE /24: {base_ip}.* → +256 IP")
-        
-        # Extraire les patterns /16 (xxx.xxx.*)  
+
+        # Extraire les patterns /16 (xxx.xxx.*)
         wildcard_16_matches = re.findall(r'\*@(\d{1,3}\.\d{1,3}\.)\*', message)
         for pattern in wildcard_16_matches:
             base_ip = pattern.rstrip('.')
             pattern_key = f"{base_ip}.*"
-            if pattern_key not in self.glined_ips:
-                self.glined_ips.add(pattern_key)
+            if pattern_key not in self.stats_g_temp_list:
+                self.stats_g_temp_list.add(pattern_key)
                 logging.debug(f"📥 CHARGEMENT GLINE /16: {base_ip}.*")
-        
+
         # Extraire autres patterns wildcard non-standard (ex: 188.188.15*, 88.172*)
         other_wildcards = re.findall(r'\*@(\d{1,3}\.\d{1,3}\.[\d*]+)\*', message)
         for pattern in other_wildcards:
             if not re.match(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', pattern):  # Éviter doublons IP complètes
                 pattern_key = f"{pattern}*"
-                if pattern_key not in self.glined_ips:
-                    self.glined_ips.add(pattern_key)
+                if pattern_key not in self.stats_g_temp_list:
+                    self.stats_g_temp_list.add(pattern_key)
                     logging.debug(f"📥 CHARGEMENT GLINE wildcard: {pattern}*")
 
     
     def on_endofstats(self, connection, event):
         """Appelé à la fin de la réponse STATS"""
+        # Traiter la synchronisation OU la vérification
+        if self.stats_g_requested or self.server_gline_check_pending:
+            # Remplacer complètement les listes locales par la liste serveur
+            if self.stats_g_temp_list is not None:
+                old_count = len(self.glined_ips)
+                self.glined_ips = self.stats_g_temp_list
+                self.gline_details = self.stats_g_temp_details
+
+                if self.stats_g_requested:
+                    logging.info(f"✅ Liste GLINE synchronisée avec serveur: {old_count} → {len(self.glined_ips)} IP bannies")
+                else:
+                    logging.info(f"✅ Liste GLINE mise à jour pour vérification: {old_count} → {len(self.glined_ips)} IP bannies")
+
+                # Réinitialiser les listes temporaires
+                self.stats_g_temp_list = None
+                self.stats_g_temp_details = None
+
+        # Réinitialiser le flag de synchronisation
         if self.stats_g_requested:
             self.stats_g_requested = False
-            logging.info(f"Liste GLINE mise à jour: {len(self.glined_ips)} IP bannies")
-        
-        # Traiter aussi la vérification des GLINE pour les contournements
+
+        # Traiter la vérification des GLINE pour les contournements (après mise à jour des listes)
         if self.server_gline_check_pending and hasattr(self, 'pending_gline_verification'):
             self.process_gline_verification(connection)
     
@@ -705,11 +736,11 @@ class GlineBot(irc.bot.SingleServerIRCBot):
                 connection.send_raw(gline_hostname_command)
                 self.glined_ips.add(hostname)
             
-            # GLINE 3: Bannir le pseudo
+            # GLINE 3: Bannir le pseudo (UnrealIRCd va automatiquement bannir son IP actuelle)
             if nick:
                 nick_reason = self.gline_config.get('nick_reason', 'Auto Gline - Pseudo contournant ban via BNC')
-                gline_nick_command = f"GLINE {nick}@* {self.gline_duration} :{nick_reason}"
-                logging.info(f"🔨 GLINE PSEUDO: {gline_nick_command}")
+                gline_nick_command = f"GLINE {nick} {self.gline_duration} :{nick_reason}"
+                logging.info(f"🔨 GLINE PSEUDO (IP réelle): {gline_nick_command}")
                 connection.send_raw(gline_nick_command)
             else:
                 logging.warning("⚠️ Pseudo non détecté")
