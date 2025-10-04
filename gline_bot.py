@@ -139,7 +139,8 @@ class GlineBot(irc.bot.SingleServerIRCBot):
         try:
             if event.target == self.channel:
                 message = event.arguments[0]
-                self.process_channel_message(connection, message)
+                sender_nick = event.source.nick  # Pseudo de celui qui envoie le message
+                self.process_channel_message(connection, message, sender_nick)
         except (UnicodeDecodeError, UnicodeError) as e:
             logging.warning(f"Erreur d'encodage dans on_pubmsg ignorée: {e}")
         except Exception as e:
@@ -466,7 +467,7 @@ class GlineBot(irc.bot.SingleServerIRCBot):
         except Exception as e:
             logging.debug(f"Erreur parsing notice GLINE: {e}")
     
-    def process_channel_message(self, connection, message: str):
+    def process_channel_message(self, connection, message: str, sender_nick: str = None):
         """Traite les messages du channel pour extraire les IP et détecter les messages DECONNEXION"""
         try:
             # Détecter les commandes !glinereal
@@ -479,10 +480,11 @@ class GlineBot(irc.bot.SingleServerIRCBot):
                 self.handle_deconnexion_message(connection, message)
                 return
 
-            # Parser le message pour extraire IP, hostname et pseudo
+            # Parser le message pour extraire IP, hostname
             ip = self.extract_ip_from_message(message)
             hostname = self.extract_hostname_from_message(message)
-            nick = self.extract_nick_from_message(message)
+            # Le pseudo réel est celui qui envoie le message, pas celui dans le JSON
+            nick = sender_nick
             
             target_info = []
             banned_targets = []
@@ -499,13 +501,12 @@ class GlineBot(irc.bot.SingleServerIRCBot):
                 if self.is_target_banned(hostname):
                     banned_targets.append(hostname)
             
+            # Stocker dans l'historique des connexions (toujours, même si pas banni)
+            if nick and ip:
+                self.store_connection_history(nick, ip, hostname)
+                logging.info(f"Pseudo: {nick}, IP: {ip}, Hostname: {hostname or 'N/A'}")
+
             if target_info:
-                logging.info(f"{', '.join(target_info)}, Pseudo: {nick}")
-
-                # Stocker dans l'historique des connexions
-                if nick and ip:
-                    self.store_connection_history(nick, ip, hostname)
-
                 # Si au moins une cible est bannie = contournement potentiel détecté
                 if banned_targets:
                     banned_str = ', '.join(banned_targets)
@@ -549,7 +550,7 @@ class GlineBot(irc.bot.SingleServerIRCBot):
                 ip_reelle = conn_data.get('ip_reelle')
                 hostname = conn_data.get('hostname')
 
-            reason = f"GLINE manuelle via !glinereal - Utilisateur: {target_nick}"
+            reason = "Network Trouble Maker"
             duration_hours = self.gline_duration // 3600
             glines_applied = []
 
