@@ -87,7 +87,11 @@ class GlineBot(irc.bot.SingleServerIRCBot):
         # Listes temporaires pour la synchronisation STATS g
         self.stats_g_temp_list = None
         self.stats_g_temp_details = None
-        
+
+        # Historique des connexions pour commandes manuelles (stocke les 1000 dernières)
+        self.connection_history: Dict[str, Dict[str, Any]] = {}  # nick -> {ip_reelle, hostname, timestamp}
+        self.max_history = 1000
+
         # Cooldown anti-spam pour les rebans
         self.reban_cooldown = 60  # Cooldown de 60 secondes
         self.recent_rebans: Dict[str, float] = {}  # IP/nick -> timestamp du dernier reban
@@ -465,11 +469,16 @@ class GlineBot(irc.bot.SingleServerIRCBot):
     def process_channel_message(self, connection, message: str):
         """Traite les messages du channel pour extraire les IP et détecter les messages DECONNEXION"""
         try:
+            # Détecter les commandes !glinereal
+            if message.startswith("!glinereal "):
+                self.handle_glinereal_command(connection, message)
+                return
+
             # Détecter les messages DECONNEXION
             if message.startswith("DECONNEXION "):
                 self.handle_deconnexion_message(connection, message)
                 return
-            
+
             # Parser le message pour extraire IP, hostname et pseudo
             ip = self.extract_ip_from_message(message)
             hostname = self.extract_hostname_from_message(message)
@@ -492,7 +501,11 @@ class GlineBot(irc.bot.SingleServerIRCBot):
             
             if target_info:
                 logging.info(f"{', '.join(target_info)}, Pseudo: {nick}")
-                
+
+                # Stocker dans l'historique des connexions
+                if nick and ip:
+                    self.store_connection_history(nick, ip, hostname)
+
                 # Si au moins une cible est bannie = contournement potentiel détecté
                 if banned_targets:
                     banned_str = ', '.join(banned_targets)
@@ -509,6 +522,90 @@ class GlineBot(irc.bot.SingleServerIRCBot):
         except Exception as e:
             logging.error(f"Erreur lors du traitement du message: {e}")
     
+    def handle_glinereal_command(self, connection, message: str):
+        """Traite la commande !glinereal <pseudo> pour GLINE l'IP BNC ET l'IP réelle d'un utilisateur
+
+        Applique 2 GLINE :
+        1. GLINE <pseudo> → UnrealIRCd bannit automatiquement l'IP du BNC
+        2. GLINE *@<ip_reelle> → Bannit l'IP réelle de l'utilisateur (depuis l'historique)
+        """
+        try:
+            parts = message.split()
+            if len(parts) < 2:
+                connection.privmsg(self.channel, "❌ Usage: !glinereal <pseudo>")
+                return
+
+            target_nick = parts[1].strip()
+
+            if not self.is_oper:
+                connection.privmsg(self.channel, f"❌ Impossible d'appliquer GLINE: pas de privilèges OPER")
+                return
+
+            # Chercher l'IP réelle dans l'historique
+            ip_reelle = None
+            hostname = None
+            if target_nick in self.connection_history:
+                conn_data = self.connection_history[target_nick]
+                ip_reelle = conn_data.get('ip_reelle')
+                hostname = conn_data.get('hostname')
+
+            reason = f"GLINE manuelle via !glinereal - Utilisateur: {target_nick}"
+            duration_hours = self.gline_duration // 3600
+            glines_applied = []
+
+            # GLINE 1: Bannir le pseudo (UnrealIRCd bannit automatiquement l'IP du BNC)
+            gline_pseudo_command = f"GLINE {target_nick} {self.gline_duration} :{reason}"
+            logging.info(f"🔨 GLINE 1/2 - Pseudo (IP BNC): {gline_pseudo_command}")
+            connection.send_raw(gline_pseudo_command)
+            glines_applied.append(f"Pseudo {target_nick} (IP BNC)")
+
+            # GLINE 2: Bannir l'IP réelle (si disponible dans l'historique)
+            if ip_reelle:
+                gline_ip_command = f"GLINE *@{ip_reelle} {self.gline_duration} :{reason}"
+                logging.info(f"🔨 GLINE 2/2 - IP réelle: {gline_ip_command}")
+                connection.send_raw(gline_ip_command)
+                self.glined_ips.add(ip_reelle)
+                glines_applied.append(f"IP réelle {ip_reelle}")
+
+                # Notification complète
+                response = f"✅ GLINE appliquée sur {target_nick} → IP BNC (via pseudo) + IP réelle: {ip_reelle}"
+                if hostname and hostname != ip_reelle:
+                    response += f" | Hostname: {hostname}"
+                response += f" | Durée: {duration_hours}h"
+            else:
+                # Seulement GLINE du pseudo (pas d'IP réelle dans l'historique)
+                response = f"⚠️ GLINE partielle sur {target_nick} → IP BNC (via pseudo) uniquement"
+                response += f" | IP réelle non trouvée dans l'historique | Durée: {duration_hours}h"
+                logging.warning(f"⚠️ IP réelle non trouvée pour {target_nick} dans l'historique ({len(self.connection_history)} entrées)")
+
+            connection.privmsg(self.channel, response)
+            logging.info(f"📢 {response}")
+
+        except Exception as e:
+            logging.error(f"Erreur lors du traitement de !glinereal: {e}")
+            connection.privmsg(self.channel, f"❌ Erreur lors du traitement de la commande")
+
+    def store_connection_history(self, nick: str, ip_reelle: str, hostname: str = None):
+        """Stocke une connexion dans l'historique (rotation automatique si > max_history)"""
+        try:
+            # Si l'historique est plein, supprimer l'entrée la plus ancienne
+            if len(self.connection_history) >= self.max_history:
+                # Trouver l'entrée avec le timestamp le plus ancien
+                oldest_nick = min(self.connection_history, key=lambda k: self.connection_history[k]['timestamp'])
+                del self.connection_history[oldest_nick]
+                logging.debug(f"🧹 Rotation historique: suppression de {oldest_nick}")
+
+            # Stocker la nouvelle connexion
+            self.connection_history[nick] = {
+                'ip_reelle': ip_reelle,
+                'hostname': hostname,
+                'timestamp': time.time()
+            }
+            logging.debug(f"📝 Historique: {nick} → IP réelle: {ip_reelle} (Total: {len(self.connection_history)} entrées)")
+
+        except Exception as e:
+            logging.error(f"Erreur lors du stockage dans l'historique: {e}")
+
     def handle_deconnexion_message(self, connection, message: str):
         """Traite les messages DECONNEXION et envoie la réponse OK"""
         try:
@@ -517,10 +614,10 @@ class GlineBot(irc.bot.SingleServerIRCBot):
             if len(parts) >= 2:
                 second_parameter = parts[1]
                 response = f"OK {second_parameter}"
-                
+
                 logging.info(f"Message DECONNEXION détecté: {message}")
                 logging.info(f"Envoi de la réponse: {response}")
-                
+
                 # Envoyer la réponse sur le channel #services_infos
                 connection.privmsg(self.channel, response)
             else:
