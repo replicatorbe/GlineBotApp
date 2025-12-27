@@ -14,9 +14,10 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime
 from typing import Set, Dict, Any
 
-# Configuration du logging
+# Configuration du logging principal
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -25,6 +26,40 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+
+def setup_services_infos_logger():
+    """Configure un logger séparé pour les messages bruts de #services_infos"""
+    # Créer le répertoire logs s'il n'existe pas
+    logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+    if not os.path.exists(logs_dir):
+        os.makedirs(logs_dir)
+        logging.info(f"Répertoire logs créé: {logs_dir}")
+
+    # Nom du fichier avec la date du jour
+    today = datetime.now().strftime('%d-%m-%Y')
+    log_filename = os.path.join(logs_dir, f'services_infos_{today}.log')
+
+    # Créer un logger séparé
+    services_logger = logging.getLogger('services_infos')
+    services_logger.setLevel(logging.INFO)
+
+    # Éviter la propagation vers le logger root
+    services_logger.propagate = False
+
+    # Supprimer les handlers existants pour éviter les doublons au reload
+    services_logger.handlers = []
+
+    # Ajouter le handler fichier
+    file_handler = logging.FileHandler(log_filename, encoding='utf-8')
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+    services_logger.addHandler(file_handler)
+
+    logging.info(f"Logger #services_infos configuré: {log_filename}")
+    return services_logger
+
+# Initialiser le logger pour #services_infos
+services_infos_logger = setup_services_infos_logger()
 
 class GlineBot(irc.bot.SingleServerIRCBot):
     """Bot IRC pour la gestion automatique des GLINE"""
@@ -140,6 +175,10 @@ class GlineBot(irc.bot.SingleServerIRCBot):
             if event.target == self.channel:
                 message = event.arguments[0]
                 sender_nick = event.source.nick  # Pseudo de celui qui envoie le message
+
+                # Logger le message brut dans le fichier services_infos
+                services_infos_logger.info(f"<{sender_nick}> {message}")
+
                 self.process_channel_message(connection, message, sender_nick)
         except (UnicodeDecodeError, UnicodeError) as e:
             logging.warning(f"Erreur d'encodage dans on_pubmsg ignorée: {e}")
