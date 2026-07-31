@@ -1,12 +1,13 @@
 #!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Script de gestion du bot IRC GLINE
 # Usage: ./start.sh {start|stop|restart|status}
 
 BOT_NAME="gline_bot"
 BOT_SCRIPT="gline_bot.py"
-PID_FILE="/home/jerome/ircbotflutter/.gline_bot.pid"
-LOG_FILE="/home/jerome/ircbotflutter/gline_bot.log"
+PID_FILE="$SCRIPT_DIR/.gline_bot.pid"
+LOG_FILE="$SCRIPT_DIR/gline_bot.log"
 
 # Couleurs pour l'affichage
 RED='\033[0;31m'
@@ -14,7 +15,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-cd /home/jerome/ircbotflutter
+cd "$SCRIPT_DIR"
 
 get_pid() {
     if [ -f "$PID_FILE" ]; then
